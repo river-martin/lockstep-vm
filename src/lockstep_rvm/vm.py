@@ -1,6 +1,10 @@
-import numpy as np
 import sys
-import copy
+
+from typing import TypeVar
+
+ITEM = TypeVar("ITEM")
+K = TypeVar("K")
+V = TypeVar("V")
 
 
 class Instr:
@@ -18,7 +22,7 @@ class Instr:
         return f"{self.op} {args_str}".strip()
 
 
-class SharedDict(dict):
+class SharedDict(dict[K, V]):
     def __init__(self, *args, ref_count=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.ref_count = ref_count
@@ -32,29 +36,24 @@ class Thread:
     """A metaphorical thread for the VM to execute."""
 
     def __init__(
-        self, ip, pending_save: SharedDict, saves_in_current_step, saves_in_last_step
+        self,
+        ip,
+        pending_save: SharedDict[int, int],
+        curr_saves: list[int],
+        prev_saves: list[int],
     ):
         self.ip = ip
-        self.pending_save: SharedDict = pending_save
-        self.lsaves = saves_in_last_step
-        self.csaves = saves_in_current_step
+        self.save = pending_save
+        self.curr_saves = curr_saves
+        self.prev_saves = prev_saves
 
     def __repr__(self):
-        return f"Thread(ip={self.ip}, pending_save={self.pending_save})"
-
-    def copy(self):
-        self.pending_save.ref_count += 1
-        return Thread(
-            self.ip,
-            self.pending_save,
-            self.csaves,
-            self.lsaves,
-        )
+        return f"Thread(ip={self.ip}, pending_save={self.save})"
 
 
-class Deque(list):
-    def __init__(self):
-        super().__init__()
+class Deque(list[ITEM]):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     def append(self, item):
         super().append(item)
@@ -71,76 +70,94 @@ class Deque(list):
     def __repr__(self):
         return f"Deque({super().__repr__()})"
 
-    def copy(self):
-        c = Deque()
-        for item in self:
-            c.append(item.copy())
-        return c
-
-
+import copy
 class State:
-    def __init__(self, threads: Deque):
-        self.ips = tuple(thread.ip for thread in threads)
-        self.threads = threads.copy()
+    def __init__(self, threads: Deque[Thread]):
+        self.ipq = tuple(thread.ip for thread in threads)
+        self.threads = tuple(copy.deepcopy(threads))
 
     def __repr__(self):
-        return f"State(ips={self.ips})"
+        return f"State(ips={self.ipq})"
 
     def __hash__(self):
-        return hash(self.ips)
+        return hash(self.ipq)
 
     def __eq__(self, other):
-        for i in range(len(self.ips)):
-            if self.ips[i] != other.ips[i]:
+        for i in range(len(self.ipq)):
+            if self.ipq[i] != other.ipq[i]:
                 return False
-        return len(self.ips) == len(other.ips)
+        return len(self.ipq) == len(other.ipq)
 
     def is_dead(self):
         return len(self.threads) == 0
 
 
-def commit_saves(pending_save: SharedDict, save: list[int]):
+def commit_saves(pending_save: SharedDict[int, int], save: list[int]):
     """Write saves to the shared buffer"""
     print(f"writing saves ({len(pending_save)})")
     for i, sp in pending_save.items():
         save[i] = sp
-    pending_save.clear()
 
 
-def run(prog: list[Instr], text: str) -> tuple[str | None, list[int]]:
+def write(pending_save: SharedDict[int, int], j: int, sp: int):
+    if pending_save.ref_count > 1:
+        pending_save.ref_count -= 1
+        pending_save = pending_save.new_copy()
+    pending_save[j] = sp
+    return pending_save
+
+
+def run(prog: list[Instr], text: str) -> list[int]:
     """Run `prog` with the `text` input and return the matched text (or `None`)."""
-    query_text = text + "\0"
-    q = Deque()
-    next_q = Deque()
-    num_saves = max(int(instr.args[0]) for instr in prog if instr.op == "save") + 1
+    text = text + "\0"
+    q, next_q = Deque[Thread](), Deque[Thread]()
+    max_save_id = max(int(instr.args[0]) for instr in prog if instr.op == "save") + 1
     num_epssets = sum(1 for instr in prog if instr.op == "epsset")
     eps_sp = []
-    thread: Thread = Thread(0, SharedDict(), [], [])
+    thread: Thread = Thread(0, SharedDict[int, int](), [], [])
     next_q.append(thread)
     sp = -1
-    prev_match = None
-    prev_saves: list[int] = []
     # For tracing the VM's execution
     line_executed = ""
     comment = ""
-    save: list[int] = [-1] * num_saves
 
     next_eps_sp = [-1] * num_epssets
 
-    cache = {}
+    match_thread = dict[State, Thread]()
+    ns_cache = dict[State, dict[str, State]]()
 
-    next_state = State(next_q)
+    state, next_state = None, State(next_q)
+    prev_match_thread = None
 
     while not next_state.is_dead():
         print(f"{line_executed:<20} {comment}")
         line_executed = ""
         comment = ""
-        
-        state, next_state = next_state, None
-        next_q, q = q, state.threads
-        parallel_branch_count = len(q)
+
+        prev_state = state
+        state = next_state
+        next_state = None
+
         sp += 1
         print(f"\n; sp advanced (`sp` = {sp})\n")
+
+        if state in ns_cache.keys() and text[sp] in ns_cache[state].keys():
+            print(f"Cache hit: {state} {text[sp]}")
+            next_state = ns_cache[state][text[sp]]
+
+            # write captures
+            for thread in next_state.threads:
+                for j in thread.prev_saves:
+                    print(f"setting pending_save[{j}] = {sp}")
+                    thread.save = write(thread.save, j, sp)
+            mt = match_thread.get(state)
+            if mt is not None:
+                for j in mt.prev_saves:
+                    mt.save = write(mt.save, j, sp)
+                prev_match_thread = mt
+            continue
+
+        q, next_q = next_q, q
         next_q.clear()
 
         eps_sp, next_eps_sp = next_eps_sp, eps_sp
@@ -148,21 +165,7 @@ def run(prog: list[Instr], text: str) -> tuple[str | None, list[int]]:
 
         marked = [False] * len(prog)
 
-        if hash(state) in cache.keys() and query_text[sp] in cache[hash(state)].keys():
-            next_state = cache[hash(state)][query_text[sp]]
-            print(hash(state), hash(next_state))
-            print(query_text[sp], query_text[sp+1])
-            # write captures
-            for thread in next_state.threads:
-                for j in thread.lsaves:
-                    print(f"setting pending_save[{j}] = {sp}")
-                    thread.pending_save[j] = sp
-                        
-            print(f"Cache hit: {state} {query_text[sp]}")
-            continue
-        next_thread_id = 0
         while len(q) > 0:
-
             print(f"{line_executed:<20} {comment}")
             thread = q.pop_front()
             if marked[thread.ip]:
@@ -170,7 +173,7 @@ def run(prog: list[Instr], text: str) -> tuple[str | None, list[int]]:
                 print(
                     f"{line_executed:<20} ; thread killed (ip {thread.ip} already visited)"
                 )
-                thread.pending_save.ref_count -= 1
+                thread.save.ref_count -= 1
                 line_executed = ""
                 comment = ""
                 continue
@@ -187,95 +190,107 @@ def run(prog: list[Instr], text: str) -> tuple[str | None, list[int]]:
                     d1, d2 = map(int, instr.args)
                     q.prepend(
                         Thread(
-                            d2, thread.pending_save, thread.csaves.copy(), thread.lsaves.copy()
+                            d2,
+                            thread.save.new_copy(),
+                            thread.curr_saves.copy(),
+                            thread.prev_saves.copy(),
                         )
                     )
                     q.prepend(
                         Thread(
-                            d1, thread.pending_save, thread.csaves.copy(), thread.lsaves.copy()
+                            d1,
+                            thread.save.new_copy(),
+                            thread.curr_saves.copy(),
+                            thread.prev_saves.copy(),
                         )
                     )
-                    thread.pending_save.ref_count += 1
+                    thread.save.ref_count += 1
+                    del thread
                     continue
-                case "char":
-                    if sp >= len(text) or text[sp] != instr.args[0]:
-                        comment = f"; thread killed (r'{r'\0' if sp >= len(text) else text[sp]}' != r'{instr.args[0]}')\n"
-                        thread.pending_save.ref_count -= 1
-                    else:
-                        thread.ip += 1
-                        if (
-                            len(q) == 0
-                            and parallel_branch_count == 1
-                            and len(thread.pending_save) > 0
-                        ):
-                            commit_saves(thread.pending_save, save)
-                        thread.lsaves, thread.csaves = thread.csaves, []
-                        next_q.append(thread)
-                        next_eps_sp = eps_sp.copy()
-                        comment = f"; added ip `{thread.ip}` to `next_q` (`*sp == {instr.args[0]}`)'\n"
-                    next_thread_id += 1
-                    continue
-                case "epsset":
-                    j = int(instr.args[0]) // 8
-                    eps_sp[j] = sp
-
-                case "epschk":
-                    j = int(instr.args[0]) // 8
-                    if eps_sp[j] == sp:
-                        comment = f"; thread killed (eps_sp[{j}] == sp == {sp})\n"
-                        thread.pending_save.ref_count -= 1
-                        continue
-                    pass
-
-                case "save":
-                    j = int(instr.args[0])
-                    if parallel_branch_count == 1:
-                        save[j] = sp
-                    else:
-                        if thread.pending_save.ref_count > 1:
-                            thread.pending_save.ref_count -= 1
-                            thread.pending_save = thread.pending_save.new_copy()
-                        thread.pending_save[j] = sp
-                        thread.csaves.append(j)
-                case "match":
-                    match_save = copy.deepcopy(save)
-                    print(thread.pending_save)
-                    for j in thread.lsaves:
-                        thread.pending_save[j] = sp - 1
-                    if len(next_q) == 0:
-                        commit_saves(thread.pending_save, match_save)
-                    prev_saves = copy.deepcopy(save)
-                    q.clear()
-                    print(f"{line_executed:<20} {comment}")
-                    break
                 case "tswitch":
                     j = int(instr.args[0])
                     for i in reversed(range(j)):
-                        thread = Thread(int(instr.args[i + 1]), thread.pending_save, thread.csaves.copy(), thread.lsaves.copy())
-                        thread.pending_save.ref_count += 1
-                        q.prepend(thread)
+                        t = Thread(
+                            int(instr.args[i + 1]),
+                            thread.save.new_copy(),
+                            thread.curr_saves.copy(),
+                            thread.prev_saves.copy(),
+                        )
+                        thread.save.ref_count += 1
+                        q.prepend(t)
+                    thread.save.ref_count -= 1
+                    del thread
                     continue
+
+                case "char":
+                    if text[sp] != instr.args[0]:
+                        comment = (
+                            f"; thread killed (r'{text[sp]}' != r'{instr.args[0]}')\n"
+                        )
+                        thread.save.ref_count -= 1
+                        del thread
+                    else:
+                        thread.ip += 1
+                        thread.prev_saves = thread.curr_saves.copy()
+                        thread.curr_saves = []
+                        thread.save = thread.save.new_copy()
+                        next_q.append(thread)
+                        next_eps_sp = eps_sp.copy()
+                        comment = f"; added ip `{thread.ip}` to `next_q` (`*sp == {instr.args[0]}`)'\n"
+                    continue
+
+                case "save":
+                    j = int(instr.args[0])
+                    thread.save = write(thread.save, j, sp)
+                    thread.curr_saves.append(j)
+                case "match":
+                    q.clear()
+                    print(f"{line_executed:<20} {comment}")
+                    thread.save = thread.save.new_copy()
+                    thread.curr_saves = thread.curr_saves.copy()
+                    thread.prev_saves = thread.prev_saves.copy()
+                    prev_match_thread = thread
+                    break
+
                 case "end":
-                    if sp != len(text):
+                    if text[sp] != "\0":
                         comment = f"; thread killed (sp != len(text))\n"
-                        thread.pending_save.ref_count -= 1
+                        thread.save.ref_count -= 1
                         del thread
                         continue
                 case "begin":
                     if sp != 0:
                         comment = f"; thread killed (sp != 0)\n"
-                        thread.pending_save.ref_count -= 1
+                        thread.save.ref_count -= 1
                         del thread
                         continue
+                case "epsset":
+                    j = int(instr.args[0]) // 8
+                    eps_sp[j] = sp
+                    pass
+                case "epschk":
+                    j = int(instr.args[0]) // 8
+                    if eps_sp[j] == sp:
+                        comment = f"; thread killed (eps_sp[{j}] == sp == {sp})\n"
+                        thread.save.ref_count -= 1
+                        continue
+                    pass
                 case _:
                     raise ValueError(f"Unknown instruction: {instr.op}")
             thread.ip += 1
             q.prepend(thread)
-        if hash(state) not in cache.keys():
-            cache[hash(state)] = {}
+        if prev_match_thread is not None:
+            match_thread[state] = prev_match_thread
+        if not state in ns_cache.keys():
+            ns_cache[state] = dict[str, State]()
+        if prev_state in ns_cache.keys():
+            assert prev_state is not None
+            ns_cache[prev_state][text[sp - 1]] = state
         next_state = State(next_q)
-        cache[hash(state)][query_text[sp]] = next_state
-    return prev_match, prev_saves
+    match_save = [-1] * max_save_id
+    if prev_match_thread is not None:
+        commit_saves(prev_match_thread.save, match_save)
+    return match_save
 
 
 def prog_to_str(prog: list[Instr]) -> str:
@@ -298,7 +313,7 @@ if __name__ == "__main__":
     from lockstep_rvm import assembler
 
     try:
-        rasm_file_name, query_text = sys.argv[1], sys.argv[2]
+        rasm_file_name, text = sys.argv[1], sys.argv[2]
     except IndexError:
         print("Usage: python -m lockstep_rvm.vm <rasm_file_name> <text_to_match>")
         sys.exit(1)
@@ -306,8 +321,8 @@ if __name__ == "__main__":
 
     assert prog_to_str(prog) == open(rasm_file_name).read()
 
-    _, saves = run(prog, query_text)
+    saves = run(prog, text)
 
     print()
-    print_captures(query_text, saves)
+    print_captures(text, saves)
     print()
