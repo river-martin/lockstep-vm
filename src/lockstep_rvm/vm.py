@@ -111,7 +111,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
 
     state, next_state = None, State(next_q)
     prev_match_thread = None
-    used_cache = False
+    captures_skipped = False
 
     while not next_state.is_dead():
         print(f"{line_executed:<20} {comment}")
@@ -134,44 +134,20 @@ def run(prog: list[Instr], text: str) -> list[int]:
             and text[sp] in ns_cache[state].keys()
         ):
             next_state = ns_cache[state][text[sp]]
+            if next_state != state or text[sp] != text[sp+1]:
+                print("next_state != state")
+                for thread in next_state.threads:
+                    exec_prev_saves(thread, sp)
+                captures_skipped = False
+            else:
+                captures_skipped = True
             print(f"Cache hit: {state} {text[sp]}")
-            used_cache = True
             continue
 
-
-            # if (state == next_state and sp + 1 < len(text) and text[sp + 1] == text[sp]):
-            #     print(f"Cache hit: {state} {text[sp]}")
-            #     # # write captures
-            #     # for thread in next_state.threads:
-            #     #     print(thread.prev_save_id)
-            #     #     exec_prev_saves(thread, sp)
-            #     used_cache = True
-            #     continue
-            # if not (state == next_state and sp + 1 < len(text) and text[sp + 1] == text[sp]):
-            #     print(state == next_state, sp + 1 < len(text))
-            #     # write captures
-            #     # for thread in next_state.threads:
-            #     #     print(thread.prev_save_id)
-            #     #     exec_prev_saves(thread, sp)
-            #     if sp + 1 < len(text):
-            #         print(f"Cache hit: {state} {text[sp]}")
-            #         used_cache = True
-            #         continue
-
-            #     # for thread in state.threads:
-            #     #     exec_saves(thread, sp-2)
-            #     #     exec_prev_saves(thread, sp-2)
-
-            #     # mt = match_thread.get(state)
-            #     # if mt is not None:
-            #     #     exec_saves(mt, sp)
-            #     #     prev_match_thread = mt
-                
-            #     pass
-        if used_cache:
+        if captures_skipped:
             for thread in state.threads:
                 exec_prev_saves(thread, sp-1)
-            used_cache = False
+            captures_skipped = False
 
         q, next_q = Deque(state.threads), q
         next_q.clear()
