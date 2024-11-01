@@ -1,11 +1,25 @@
 import sys
-import copy
-
+import logging
 from typing import TypeVar
 
 ITEM = TypeVar("ITEM")
 K = TypeVar("K")
 V = TypeVar("V")
+
+GREY_START = "\033[90m"
+COLOUR_RESET = "\033[0m"
+
+logging.basicConfig(format="%(message)s")
+logger = logging.getLogger(__name__)
+
+
+def log(
+    *values: object,
+    sep=" ",
+    end="",
+) -> None:
+    msg = sep.join(map(str, values)) + end
+    logger.debug(msg)
 
 
 class Instr:
@@ -83,16 +97,29 @@ class State:
         return len(self.threads) == 0
 
 
-def exec_prev_saves(thread, sp):
-    for i in thread.prev_save_id:
-        print(f"setting save[{i}] = {sp}")
-        thread.save[i] = sp
+def exec_prev_saves(state: State, sp: int):
+    """For each thread in the state, execute the saves for the previous step"""
+    for i, thread in enumerate(state.threads):
+        log(f"executing prev saves for thread {i}")
+        for j in thread.prev_save_id:
+            log(f"setting save[{j}] = {sp}")
+            thread.save[j] = sp
 
 
-def exec_saves(thread, sp):
-    for i in thread.save_id:
-        print(f"setting save[{i}] = {sp}")
-        thread.save[i] = sp
+def exec_saves(state: State, sp: int):
+    """For each thread in the state, execute the saves for the current step"""
+    for i, thread in enumerate(state.threads):
+        log(f"executing saves for thread {i}")
+        for j in thread.save_id:
+            log(f"setting save[{j}] = {sp}")
+            thread.save[j] = sp
+
+
+def update_match(thread: Thread, sp: int) -> Thread:
+    """Execute the saves for the match thread"""
+    for sid in thread.save_id:
+        thread.save[sid] = sp
+    return thread
 
 
 def run(prog: list[Instr], text: str) -> list[int]:
@@ -106,15 +133,15 @@ def run(prog: list[Instr], text: str) -> list[int]:
     line_executed = ""
     comment = ""
 
-    match_thread = dict[State, Thread]()
+    state_to_match_thread = dict[State, Thread]()
     ns_cache = dict[State, dict[str, State]]()
 
     state, next_state = None, State(next_q)
     prev_match_thread = None
-    captures_skipped = False
+    skipped_saves_and_match = False
 
     while not next_state.is_dead():
-        print(f"{line_executed:<20} {comment}")
+        log(f"{line_executed:<20} {comment}")
         line_executed = ""
         comment = ""
 
@@ -123,31 +150,39 @@ def run(prog: list[Instr], text: str) -> list[int]:
         next_state = None
 
         sp += 1
-        print(f"\n; sp advanced (`sp` = {sp})\n")
+        log(f"\n; sp advanced (`sp` = {sp})\n")
 
         # What if a cache hit occurs but the path is different? i.e. what if the prev_save_id is different?
-        can_use_cache = not sp == len(text) - 1 # we can't use the cache if we're at the end of the text
+        can_use_cache = (
+            not sp == len(text) - 1
+        )  # we can't use the cache if we're at the end of the text
         if (
-            can_use_cache and 
-            state in ns_cache.keys()
+            can_use_cache
+            and state in ns_cache.keys()
             and sp < len(text)
             and text[sp] in ns_cache[state].keys()
         ):
             next_state = ns_cache[state][text[sp]]
-            if next_state != state or text[sp] != text[sp+1]:
-                print("next_state != state")
-                for thread in next_state.threads:
-                    exec_prev_saves(thread, sp)
-                captures_skipped = False
+            if next_state == state and text[sp] == text[sp + 1]:
+                # Captures and match would be overwritten in the next step, so we can skip them
+                skipped_saves_and_match = True
             else:
-                captures_skipped = True
-            print(f"Cache hit: {state} {text[sp]}")
+                # Captures and match might not be overwritten in the next step, so we need to execute them
+                exec_prev_saves(next_state, sp)
+                mthread = state_to_match_thread.get(state)
+                if mthread is not None:
+                    prev_match_thread = update_match(mthread, sp)
+                skipped_saves_and_match = False
+            log(f"Cache hit: {state} {text[sp]}")
             continue
 
-        if captures_skipped:
-            for thread in state.threads:
-                exec_prev_saves(thread, sp-1)
-            captures_skipped = False
+        if skipped_saves_and_match:
+            # We skipped the saves and match in the previous step, so we need to execute them now
+            exec_prev_saves(state, sp - 1)
+            mthread = state_to_match_thread.get(state)
+            if mthread is not None:
+                prev_match_thread = update_match(mthread, sp - 1)
+            skipped_saves_and_match = False
 
         q, next_q = Deque(state.threads), q
         next_q.clear()
@@ -160,7 +195,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
             kill_thread = False
             reason = None
 
-            print(f"{line_executed:<20} {comment}")
+            log(f"{line_executed:<20} {comment}")
             thread = q.pop_front()
             if marked[thread.ip]:
                 kill_thread = True
@@ -230,7 +265,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
 
                     case "match":
                         q.clear()
-                        print(f"{line_executed:<20} {comment}")
+                        log(f"{line_executed:<20} {comment}")
                         prev_match_thread = thread
                         prev_match_thread.prev_save_id = prev_match_thread.save_id
                         break
@@ -258,17 +293,21 @@ def run(prog: list[Instr], text: str) -> list[int]:
             thread.ip += 1
             q.prepend(thread)
         if prev_match_thread is not None:
-            print(
+            log(
                 f"Saving match thread: {prev_match_thread}, {prev_match_thread.save_id}"
             )
-            match_thread[state] = prev_match_thread
+            state_to_match_thread[state] = prev_match_thread
         if not state in ns_cache.keys():
             ns_cache[state] = dict[str, State]()
         if prev_state in ns_cache.keys():
             assert prev_state is not None
-            ns_cache[prev_state][text[sp - 1]] = state            
+            ns_cache[prev_state][text[sp - 1]] = state
         next_state = State(next_q)
-        if state in ns_cache.keys() and sp < len(text) and text[sp] in ns_cache[state].keys():
+        if (
+            state in ns_cache.keys()
+            and sp < len(text)
+            and text[sp] in ns_cache[state].keys()
+        ):
             ns = ns_cache[state][text[sp]]
             assert len(ns.threads) == len(next_state.threads)
             for i, thread in enumerate(ns.threads):
@@ -286,13 +325,25 @@ def prog_to_str(prog: list[Instr]) -> str:
 
 
 def print_captures(query_text: str, saves: list[int]):
+    max_span_width = 0
+    for i in range(len(saves) // 2):
+        start, stop = saves[2 * i], saves[2 * i + 1]
+        max_span_width = max(max_span_width, len(f"{start}-{stop}"))
+    max_group_width = len(f"Group {len(str(len(saves) // 2 - 1))}")
     for i in range(len(saves) // 2):
         start, stop = saves[2 * i], saves[2 * i + 1]
 
-        if start == -1 and stop == -1:
-            print(f"Group {i} not captured")
-        else:
-            print(f"Group {i} [{start}:{stop}]: {query_text[start:stop]}")
+        if start != -1 and stop != -1:
+            group_ident = f"Group {i}"
+            group_span = f"{start}-{stop}"
+            group_text = (
+                query_text[start:stop]
+                if start != stop
+                else GREY_START + "empty string" + COLOUR_RESET
+            )
+            print(
+                f"{group_ident:<{max_group_width}}  {GREY_START}{group_span:<{max_span_width}}{COLOUR_RESET}  | {group_text}"
+            )
 
 
 if __name__ == "__main__":
@@ -300,16 +351,23 @@ if __name__ == "__main__":
     from lockstep_rvm import assembler
 
     try:
-        rasm_file_name, text = sys.argv[1], sys.argv[2]
+        rasm_file_name, text, log_level = sys.argv[1], sys.argv[2], sys.argv[3]
     except IndexError:
-        print("Usage: python -m lockstep_rvm.vm <rasm_file_name> <text_to_match>")
+        print(
+            "Usage: python -m lockstep_rvm.vm <rasm_file_name> <text_to_match> <debug|info>"
+        )
         sys.exit(1)
+    match log_level:
+        case "debug":
+            logger.setLevel(logging.DEBUG)
+        case "info":
+            logger.setLevel(logging.INFO)
+        case _:
+            raise ValueError("log_level must be either 'debug' or 'info'")
     prog = assembler.assemble(rasm_file_name)
 
     assert prog_to_str(prog) == open(rasm_file_name).read()
 
     saves = run(prog, text)
 
-    print()
     print_captures(text, saves)
-    print()
