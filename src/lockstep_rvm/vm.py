@@ -97,32 +97,35 @@ class State:
         return len(self.threads) == 0
 
 
-def exec_prev_saves(state: State, sp: int):
+def exec_prev_saves(state: State, sp: int, perf_metrics):
     """For each thread in the state, execute the saves for the previous step"""
     for i, thread in enumerate(state.threads):
         log(f"executing prev saves for thread {i}")
         for j in thread.prev_save_id:
             log(f"setting save[{j}] = {sp}")
             thread.save[j] = sp
+        perf_metrics["n_save_writes"] += len(thread.prev_save_id)
 
 
-def exec_saves(state: State, sp: int):
+def exec_saves(state: State, sp: int, perf_metrics):
     """For each thread in the state, execute the saves for the current step"""
     for i, thread in enumerate(state.threads):
         log(f"executing saves for thread {i}")
         for j in thread.save_id:
             log(f"setting save[{j}] = {sp}")
             thread.save[j] = sp
+        perf_metrics["n_save_writes"] += len(thread.save_id)
 
 
-def update_match(thread: Thread, sp: int) -> Thread:
+def update_match(thread: Thread, sp: int, perf_metrics) -> Thread:
     """Execute the saves for the match thread"""
     for sid in thread.save_id:
         thread.save[sid] = sp
+    perf_metrics["n_save_writes"] += len(thread.save_id)
     return thread
 
 
-def run(prog: list[Instr], text: str) -> list[int]:
+def run(prog: list[Instr], text: str, use_cache):
     """Run `prog` with the `text` input and return the matched text (or `None`)."""
     q, next_q = Deque[Thread](), Deque[Thread]()
     max_save_id = max(int(instr.args[0]) for instr in prog if instr.op == "save") + 1
@@ -140,6 +143,8 @@ def run(prog: list[Instr], text: str) -> list[int]:
     prev_match_thread = None
     skipped_saves_and_match = False
 
+    perf_metrics = {"n_cache_hits": 0, "n_save_buf_copy": 0, "n_save_writes": 0}
+
     while not next_state.is_dead():
         log(f"{line_executed:<20} {comment}")
         line_executed = ""
@@ -152,9 +157,8 @@ def run(prog: list[Instr], text: str) -> list[int]:
         sp += 1
         log(f"\n; sp advanced (`sp` = {sp})\n")
 
-        # What if a cache hit occurs but the path is different? i.e. what if the prev_save_id is different?
         can_use_cache = (
-            not sp == len(text) - 1
+            not sp == len(text) - 1 and use_cache
         )  # we can't use the cache if we're at the end of the text
         if (
             can_use_cache
@@ -168,20 +172,21 @@ def run(prog: list[Instr], text: str) -> list[int]:
                 skipped_saves_and_match = True
             else:
                 # Captures and match might not be overwritten in the next step, so we need to execute them
-                exec_prev_saves(next_state, sp)
+                exec_prev_saves(next_state, sp, perf_metrics)
                 mthread = state_to_match_thread.get(state)
                 if mthread is not None:
-                    prev_match_thread = update_match(mthread, sp)
+                    prev_match_thread = update_match(mthread, sp, perf_metrics)
                 skipped_saves_and_match = False
             log(f"Cache hit: {state} {text[sp]}")
+            perf_metrics["n_cache_hits"] += 1
             continue
 
         if skipped_saves_and_match:
             # We skipped the saves and match in the previous step, so we need to execute them now
-            exec_prev_saves(state, sp - 1)
+            exec_prev_saves(state, sp - 1, perf_metrics)
             mthread = state_to_match_thread.get(state)
             if mthread is not None:
-                prev_match_thread = update_match(mthread, sp - 1)
+                prev_match_thread = update_match(mthread, sp - 1, perf_metrics)
             skipped_saves_and_match = False
 
         q, next_q = Deque(state.threads), q
@@ -229,6 +234,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
                                 thread.prev_save_id.copy(),
                             )
                         )
+                        perf_metrics["n_save_buf_copy"] += 2
                         del thread
                         continue
 
@@ -242,6 +248,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
                                 thread.prev_save_id.copy(),
                             )
                             q.prepend(t)
+                        perf_metrics["n_save_buf_copy"] += j
                         del thread
                         continue
 
@@ -262,6 +269,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
                         j = int(instr.args[0])
                         thread.save[j] = sp
                         thread.save_id.append(j)
+                        perf_metrics["n_save_writes"] += 1
 
                     case "match":
                         q.clear()
@@ -309,6 +317,8 @@ def run(prog: list[Instr], text: str) -> list[int]:
             and text[sp] in ns_cache[state].keys()
         ):
             ns = ns_cache[state][text[sp]]
+            # Check that the cache hit is consistent with the next state (i.e. prev_save_id is the same)
+            # If a different path (with different prev_save_id) can lead to the same state, then the cache is invalid
             assert len(ns.threads) == len(next_state.threads)
             for i, thread in enumerate(ns.threads):
                 assert thread.prev_save_id == next_state.threads[i].prev_save_id
@@ -316,7 +326,7 @@ def run(prog: list[Instr], text: str) -> list[int]:
     if prev_match_thread is not None:
         for sid, sp in prev_match_thread.save.items():
             match_save[sid] = sp
-    return match_save
+    return match_save, perf_metrics
 
 
 def prog_to_str(prog: list[Instr]) -> str:
@@ -346,15 +356,27 @@ def print_captures(query_text: str, saves: list[int]):
             )
 
 
+def print_stats(perf_metrics, text):
+    print(f"Cache hits: {perf_metrics['n_cache_hits']}")
+    print(f"Save buffer copies: {perf_metrics['n_save_buf_copy']}")
+    print(f"Save writes: {perf_metrics['n_save_writes']}")
+    print(f"Text length: {len(text)}")
+
+
 if __name__ == "__main__":
     import sys
     from lockstep_rvm import assembler
 
     try:
-        rasm_file_name, text, log_level = sys.argv[1], sys.argv[2], sys.argv[3]
+        rasm_file_name, text, log_level, use_cache = (
+            sys.argv[1],
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4] == "cache",
+        )
     except IndexError:
         print(
-            "Usage: python -m lockstep_rvm.vm <rasm_file_name> <text_to_match> <debug|info>"
+            "Usage: python -m lockstep_rvm.vm <rasm_file_name> <text_to_match> <debug|info> <cache|no_cache>"
         )
         sys.exit(1)
     match log_level:
@@ -364,10 +386,12 @@ if __name__ == "__main__":
             logger.setLevel(logging.INFO)
         case _:
             raise ValueError("log_level must be either 'debug' or 'info'")
+
     prog = assembler.assemble(rasm_file_name)
 
     assert prog_to_str(prog) == open(rasm_file_name).read()
 
-    saves = run(prog, text)
+    saves, perf_metrics = run(prog, text, use_cache)
 
     print_captures(text, saves)
+    print_stats(perf_metrics, text)
