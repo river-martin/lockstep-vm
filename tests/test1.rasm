@@ -1,0 +1,42 @@
+save 0
+split 10, 2
+epsset 0
+split 4, 6
+char 'a'
+jmp 7
+char 'b'
+split 10, 8
+epschk 0
+jmp 2
+save 2
+split 12, 17
+epsset 8
+char 'b'
+split 15, 17
+epschk 8
+jmp 12
+save 3
+save 4
+split 20, 25
+epsset 16
+char 'b'
+split 23, 25
+epschk 16
+jmp 20
+save 5
+save 6
+epsset 24
+char 'b'
+split 30, 32
+epschk 24
+jmp 27
+save 7
+save 8
+epsset 32
+char 'b'
+split 37, 39
+epschk 32
+jmp 34
+save 9
+save 1
+match
