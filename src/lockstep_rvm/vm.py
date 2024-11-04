@@ -77,6 +77,7 @@ class Deque(list[ITEM]):
 
 
 class State:
+    """A DFA state, with an ordered list of threads to execute."""
     def __init__(self, threads: Deque[Thread]):
         self.ipq = tuple(thread.ip for thread in threads)
         self.threads = tuple(threads)
@@ -359,7 +360,7 @@ def print_captures(query_text: str, saves: list[int]):
 def print_stats(perf_metrics, text):
     print(f"Cache hits: {perf_metrics['n_cache_hits']}")
     print(f"Save buffer copies: {perf_metrics['n_save_buf_copy']}")
-    print(f"Save writes: {perf_metrics['n_save_writes']}")
+    print(f"Save buffer writes: {perf_metrics['n_save_writes']}")
     print(f"Text length: {len(text)}")
 
 
