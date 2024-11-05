@@ -2,6 +2,19 @@ from lockstep_rvm.vm import Instr
 from lockstep_rvm.vm import Deque
 
 
+def parse_pred_args(args: list[str]) -> list[str]:
+    pred_args = []
+    if args[0] == "^":
+        pred_args.append("^")
+        args = args[1:]
+    for i, arg in enumerate(args):
+        if i % 2 == 0:
+            pred_args.append(arg[2])
+        else:
+            pred_args.append(arg[0])
+    return pred_args
+
+
 def assemble(rasm_file_name: str) -> list[Instr]:
     """
     Create a list of `Instr` objects from a file containing regex assembly code.
@@ -16,90 +29,10 @@ def assemble(rasm_file_name: str) -> list[Instr]:
             if op == "char":
                 # remove the quotes surrounding the character
                 args = [args[0][1]]
+            elif op == "pred":
+                args = parse_pred_args(args)
             prog.append(Instr(op, args))
     return prog
-
-
-def reverse(prog: list[Instr]) -> list[Instr]:
-    """
-    Reverse the program.
-    """
-    prog = [Instr("prog_start", [])] + prog
-    targets = {}
-    rev_target_count = 0
-    prog_with_labels = []
-    for i, instr in enumerate(prog):
-        match instr.op:
-            case "split":
-
-                prog_with_labels.append(Instr(f".t{rev_target_count}:", []))
-
-                if instr.args[0] not in targets.keys():
-                    targets[instr.args[0]] = [rev_target_count]
-                else:
-                    targets[instr.args[0]].append(rev_target_count)
-
-                if instr.args[1] not in targets.keys():
-                    targets[instr.args[1]] = [rev_target_count]
-                else:
-                    targets[instr.args[1]].append(rev_target_count)
-
-                rev_target_count += 1
-
-                prog_with_labels.append(Instr("nop", []))
-
-
-            case "jmp":
-
-                prog_with_labels.append(Instr(f".t{rev_target_count}:", []))
-
-                if instr.args[0] not in targets.keys():
-                    targets[instr.args[0]] = [rev_target_count]
-                else:
-                    targets[instr.args[0]].append(rev_target_count)
-
-                rev_target_count += 1
-
-                prog_with_labels.append(Instr("nop", []))
-
-            case "match":
-                prog_with_labels.append(Instr("nop", []))
-
-            case "end":
-                prog_with_labels.append(Instr("begin", []))
-
-            case "prog_start":
-                prog_with_labels.append(Instr("match", []))
-
-            case "epschk":
-                prog_with_labels.append(Instr("epsset", instr.args))
-
-            case "epsset":
-                prog_with_labels.append(Instr("epschk", instr.args))
-
-            case _:
-                prog_with_labels.append(instr)
-
-    rev = Deque()
-    i = 0
-    for instr in prog_with_labels:
-        if instr.op.startswith(".t"):
-            rev.prepend(instr)
-        else:
-            if str(i) in targets.keys():
-                rev.prepend(
-                    Instr(
-                        f"tswitch",
-                        [str(len(targets[str(i)]))]
-                        + [f".t{j}" for j in targets[str(i)]],
-                    )
-                )
-            elif instr.op == "prog_start":
-                rev.prepend(Instr("match", []))
-            elif instr.op != "nop":
-                rev.prepend(instr)
-            i += 1
-    return rev
 
 
 def preprocess_labels(prog):

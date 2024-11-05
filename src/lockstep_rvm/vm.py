@@ -33,7 +33,27 @@ class Instr:
         def arg_to_str(arg):
             return f"'{arg}'" if self.op == "char" else arg
 
-        args_str = ", ".join(map(arg_to_str, self.args))
+        if self.op == "pred":
+            if self.args[0] == "^":
+                args_str = (
+                    "^["
+                    + ", ".join(
+                        f"({self.args[i]}, {self.args[i+1]})"
+                        for i in range(1, len(self.args), 2)
+                    )
+                    + "]"
+                )
+            else:
+                args_str = (
+                    "["
+                    + ", ".join(
+                        f"({self.args[i]}, {self.args[i+1]})"
+                        for i in range(0, len(self.args), 2)
+                    )
+                    + "]"
+                )
+        else:
+            args_str = ", ".join(map(arg_to_str, self.args))
         return f"{self.op} {args_str}".strip()
 
 
@@ -78,6 +98,7 @@ class Deque(list[ITEM]):
 
 class State:
     """A DFA state, with an ordered list of threads to execute."""
+
     def __init__(self, threads: Deque[Thread]):
         self.ipq = tuple(thread.ip for thread in threads)
         self.threads = tuple(threads)
@@ -129,7 +150,14 @@ def update_match(thread: Thread, sp: int, perf_metrics) -> Thread:
 def run(prog: list[Instr], text: str, use_cache):
     """Run `prog` with the `text` input and return the matched text (or `None`)."""
     q, next_q = Deque[Thread](), Deque[Thread]()
-    max_save_id = max(int(instr.args[0]) for instr in prog if instr.op == "save") + 1
+    max_save_id = (
+        max(
+            int(instr.args[0])
+            for instr in prog
+            if instr.op == "save" and type(instr.args[0]) == str
+        )
+        + 1
+    )
     thread: Thread = Thread(0, dict[int, int](), [], [])
     next_q.append(thread)
     sp = -1
@@ -266,6 +294,25 @@ def run(prog: list[Instr], text: str, use_cache):
                             comment = f"; added ip `{thread.ip}` to `next_q` (`*sp == {instr.args[0]}`)'\n"
                             continue
 
+                    case "pred":
+                        neg = instr.args[0] == "^"
+                        interval_bounds = instr.args[1:] if neg else instr.args
+                        for i in range(0, len(interval_bounds), 2):
+                            start, stop = interval_bounds[i], interval_bounds[i + 1]
+                            if ord(start) <= ord(text[sp]) <= ord(stop):
+                                if neg:
+                                    kill_thread = True
+                                    reason = f"pred mismatch @ sp={sp}"
+                                    break
+                                else:
+                                    thread.ip += 1
+                                    thread.prev_save_id = thread.save_id
+                                    thread.save_id = []
+                                    thread.save = thread.save
+                                    next_q.append(thread)
+                                    comment = f"; added ip `{thread.ip}` to `next_q` (`{start} <= *sp <= {stop}`)\n"
+                                    break
+
                     case "save":
                         j = int(instr.args[0])
                         thread.save[j] = sp
@@ -281,14 +328,12 @@ def run(prog: list[Instr], text: str, use_cache):
 
                     case "end":
                         if sp != len(text):
-                            comment = f"; thread killed (sp != len(text))\n"
-                            del thread
-                            continue
+                            kill_thread = True
+                            reason = f"sp != len(text)"
                     case "begin":
                         if sp != 0:
-                            comment = f"; thread killed (sp != 0)\n"
-                            del thread
-                            continue
+                            kill_thread = True
+                            reason = f"sp != 0"
                     case "epsset":
                         pass
                     case "epschk":
@@ -390,6 +435,8 @@ if __name__ == "__main__":
 
     prog = assembler.assemble(rasm_file_name)
 
+    if prog_to_str(prog) != open(rasm_file_name).read():
+        print(prog_to_str(prog), open(rasm_file_name).read(), sep="\n")
     assert prog_to_str(prog) == open(rasm_file_name).read()
 
     saves, perf_metrics = run(prog, text, use_cache)
